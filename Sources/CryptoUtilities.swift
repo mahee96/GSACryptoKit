@@ -69,13 +69,13 @@ public enum CryptoUtilities {
 
     /// Decrypts AES-CBC encrypted `ciphertext` with PKCS#7 unpadding using `key` and `iv`
     public static func aesCBCDecrypt(key: Data, iv: Data, ciphertext: Data) -> Data? {
-        guard iv.count == 16 else { return nil }
+        guard iv.count >= 16 else { return nil }
         guard key.count == 16 || key.count == 24 || key.count == 32 else { return nil }
         guard !ciphertext.isEmpty, ciphertext.count % 16 == 0 else { return nil }
 
         do {
             let symmetricKey = SymmetricKey(data: key)
-            let ivObj = try AES._CBC.IV(ivBytes: iv)
+            let ivObj = try AES._CBC.IV(ivBytes: iv.prefix(16))
             return try AES._CBC.decrypt(ciphertext, using: symmetricKey, iv: ivObj, noPadding: false)
         } catch {
             return nil
