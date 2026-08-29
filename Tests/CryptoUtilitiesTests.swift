@@ -44,8 +44,9 @@ struct CryptoUtilitiesTests {
         let strings = ["Part1", "Part2", "Part3"]
         let hmac = CryptoUtilities.hmacSHA256(key: key, strings: strings)
         let hmacData = try #require(hmac)
+        #expect(hmacData.count == 32)
 
-        // HMAC over "Part1Part2Part3"
+        // Verify matches CryptoKit HMAC<SHA256> on concatenated strings
         let fullData = "Part1Part2Part3".data(using: .utf8)!
         let expected = Data(HMAC<SHA256>.authenticationCode(for: fullData, using: SymmetricKey(data: key)))
         #expect(hmacData == expected)
@@ -99,10 +100,66 @@ struct CryptoUtilitiesTests {
     }
 
     @Test
+    func s2kAndS2kFoPasswordKeyDerivation() throws {
+        let password = "MySecurePassword123!"
+        let salt = Data(repeating: 0x42, count: 16)
+        let iterations = 716
+
+        let passwordData = try #require(password.data(using: .utf8))
+        let digest = try #require(CryptoUtilities.sha256(passwordData))
+        #expect(digest.count == 32)
+
+        // s2k path: PBKDF2 with raw 32-byte digest
+        let s2kInput = digest
+        #expect(s2kInput.count == 32)
+        let s2kKey = try #require(CryptoUtilities.pbkdf2SHA256(
+            password: s2kInput,
+            salt: salt,
+            rounds: iterations,
+            outputLength: 32
+        ))
+        #expect(s2kKey.count == 32)
+
+        // s2k_fo path: PBKDF2 with 64-byte ASCII hex representation of digest
+        let s2kFoInput = Data(digest.hexEncodedString().utf8)
+        #expect(s2kFoInput.count == 64)
+        let s2kFoKey = try #require(CryptoUtilities.pbkdf2SHA256(
+            password: s2kFoInput,
+            salt: salt,
+            rounds: iterations,
+            outputLength: 32
+        ))
+        #expect(s2kFoKey.count == 32)
+
+        // Cross-validate s2k_fo key against OpenSSL PBKDF2
+        var opensslDerived = Data(count: 32)
+        _ = opensslDerived.withUnsafeMutableBytes { outBytes in
+            s2kFoInput.withUnsafeBytes { pwdBytes in
+                salt.withUnsafeBytes { saltBytes in
+                    PKCS5_PBKDF2_HMAC(
+                        pwdBytes.bindMemory(to: CChar.self).baseAddress,
+                        Int32(s2kFoInput.count),
+                        saltBytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(salt.count),
+                        Int32(iterations),
+                        EVP_sha256(),
+                        32,
+                        outBytes.bindMemory(to: UInt8.self).baseAddress
+                    )
+                }
+            }
+        }
+        #expect(s2kFoKey == opensslDerived)
+
+        // s2k and s2k_fo derivations must produce different keys for the same password
+        #expect(s2kKey != s2kFoKey)
+    }
+
+    @Test
     func aesCBCDecryption() throws {
-        let plaintext = "Secret data encrypted with AES-256-CBC with PKCS7 padding!".data(using: .utf8)!
         let key = Data((0..<32).map { UInt8($0 + 1) })
-        let iv = Data((0..<16).map { UInt8($0 + 10) })
+        let iv = Data((0..<16).map { UInt8($0 + 2) })
+        let plaintext = "Hello SideStore AES-CBC World! Testing 123.".data(using: .utf8)!
 
         // Encrypt with CryptoExtras AES._CBC
         let ciphertext = try encryptAESCBC(plaintext: plaintext, key: key, iv: iv)
@@ -115,82 +172,61 @@ struct CryptoUtilitiesTests {
 
     @Test
     func aesCBCDecryptionFailures() throws {
-        let plaintext = "Some message".data(using: .utf8)!
-        let key = Data((0..<32).map { UInt8($0 + 1) })
-        let iv = Data((0..<16).map { UInt8($0 + 10) })
+        let key = Data((0..<32).map { UInt8($0) })
+        let iv = Data((0..<16).map { UInt8($0) })
 
-        let ciphertext = try encryptAESCBC(plaintext: plaintext, key: key, iv: iv)
+        // Key length != 16, 24, 32
+        let invalidKey = Data(count: 10)
+        #expect(CryptoUtilities.aesCBCDecrypt(key: invalidKey, iv: iv, ciphertext: Data(count: 32)) == nil)
 
-        // Invalid IV length (e.g. 10 bytes instead of 16)
-        let invalidIV = Data((0..<10).map { UInt8($0) })
-        #expect(CryptoUtilities.aesCBCDecrypt(key: key, iv: invalidIV, ciphertext: ciphertext) == nil)
+        // IV length != 16
+        let invalidIV = Data(count: 8)
+        #expect(CryptoUtilities.aesCBCDecrypt(key: key, iv: invalidIV, ciphertext: Data(count: 32)) == nil)
 
-        // Invalid key length (e.g. 20 bytes)
-        let invalidKey = Data((0..<20).map { UInt8($0) })
-        #expect(CryptoUtilities.aesCBCDecrypt(key: invalidKey, iv: iv, ciphertext: ciphertext) == nil)
+        // Ciphertext not multiple of 16 bytes
+        let unalignedCipher = Data(count: 15)
+        #expect(CryptoUtilities.aesCBCDecrypt(key: key, iv: iv, ciphertext: unalignedCipher) == nil)
 
-        // Tampered ciphertext (corrupting padding / block)
-        var corruptedCipher = Data(ciphertext)
-        if let lastIdx = corruptedCipher.indices.last {
-            corruptedCipher[lastIdx] ^= 0xFF
-        }
-        #expect(CryptoUtilities.aesCBCDecrypt(key: key, iv: iv, ciphertext: corruptedCipher) == nil)
+        // Corrupted ciphertext / invalid padding
+        let corruptCipher = Data(count: 32)
+        #expect(CryptoUtilities.aesCBCDecrypt(key: key, iv: iv, ciphertext: corruptCipher) == nil)
     }
 
     @Test
     func aesGCMDecryption() throws {
-        let plaintext = "Confidential Payload to be encrypted with AES-GCM".data(using: .utf8)!
-        let keyData = Data((0..<32).map { UInt8($0 + 3) })
-        let nonceData = Data((0..<12).map { UInt8($0 + 7) })
-        let aad = "Authenticated-Additional-Data".data(using: .utf8)!
+        let key = Data((0..<32).map { UInt8($0 + 10) })
+        let nonce = Data((0..<12).map { UInt8($0 + 20) })
+        let aad = "AuthenticatedData".data(using: .utf8)!
+        let plaintext = "Secret payload encrypted with AES-GCM 256.".data(using: .utf8)!
 
-        // Seal with Crypto AES.GCM
-        let (ciphertext, tag) = try encryptAESGCM(plaintext: plaintext, key: keyData, nonce: nonceData, aad: aad)
+        // Encrypt with Crypto AES.GCM
+        let (ciphertext, tag) = try encryptAESGCM(plaintext: plaintext, key: key, nonce: nonce, aad: aad)
 
         // Decrypt with CryptoUtilities
-        let decrypted = CryptoUtilities.aesGCMDecrypt(
-            key: keyData,
-            nonce: nonceData,
-            aad: aad,
-            ciphertext: ciphertext,
-            tag: tag
-        )
-        #expect(decrypted != nil)
-        #expect(decrypted == plaintext)
+        let decrypted = CryptoUtilities.aesGCMDecrypt(key: key, nonce: nonce, aad: aad, ciphertext: ciphertext, tag: tag)
+        let decryptedData = try #require(decrypted)
+        #expect(decryptedData == plaintext)
 
-        // Tampered tag failure
-        var corruptedTag = Data(tag)
-        if let firstIdx = corruptedTag.indices.first {
-            corruptedTag[firstIdx] ^= 0xFF
-        }
-        let failedDecryption = CryptoUtilities.aesGCMDecrypt(
-            key: keyData,
-            nonce: nonceData,
-            aad: aad,
-            ciphertext: ciphertext,
-            tag: corruptedTag
-        )
-        #expect(failedDecryption == nil)
+        // Tampered tag must fail decryption
+        var tamperedTag = tag
+        tamperedTag[0] ^= 0xFF
+        let failedDecrypt = CryptoUtilities.aesGCMDecrypt(key: key, nonce: nonce, aad: aad, ciphertext: ciphertext, tag: tamperedTag)
+        #expect(failedDecrypt == nil)
 
-        // Tampered AAD failure
-        let wrongAAD = "Tampered-AAD".data(using: .utf8)!
-        let aadFailedDecryption = CryptoUtilities.aesGCMDecrypt(
-            key: keyData,
-            nonce: nonceData,
-            aad: wrongAAD,
-            ciphertext: ciphertext,
-            tag: tag
-        )
-        #expect(aadFailedDecryption == nil)
+        // Tampered ciphertext must fail decryption
+        var tamperedCipher = ciphertext
+        tamperedCipher[0] ^= 0xFF
+        let failedCipherDecrypt = CryptoUtilities.aesGCMDecrypt(key: key, nonce: nonce, aad: aad, ciphertext: tamperedCipher, tag: tag)
+        #expect(failedCipherDecrypt == nil)
     }
 
     @Test
     func crossValidationWithOpenSSL() throws {
-        let testData = "Cross validation between pure Swift and OpenSSL".data(using: .utf8)!
-        let key = Data((0..<32).map { UInt8($0 + 5) })
-        let iv = Data((0..<16).map { UInt8($0 + 2) })
-        let nonce = Data((0..<12).map { UInt8($0 + 1) })
-        let aad = "AAD-Header".data(using: .utf8)!
+        let key = Data((0..<32).map { UInt8(($0 * 3) & 0xFF) })
+        let iv = Data((0..<16).map { UInt8(($0 * 5) & 0xFF) })
+        let nonce = Data((0..<12).map { UInt8(($0 * 7) & 0xFF) })
+        let aad = "OpenSSL_CrossValidation_AAD".data(using: .utf8)!
+        let testData = "The quick brown fox jumps over the lazy dog 1234567890!@#$%^&*()".data(using: .utf8)!
 
         // 1. SHA256 cross validation
         let swiftHash = try #require(CryptoUtilities.sha256(testData))

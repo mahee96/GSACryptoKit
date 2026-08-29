@@ -111,6 +111,69 @@ struct SRPClientTests {
     }
 
     @Test
+    func s2kFoEndToEndExchange() throws {
+        let username = "s2kfo_user@example.com"
+        let password = "MySecurePassword123!"
+        let salt = Data((0..<32).map { UInt8($0 + 5) })
+        let iterations = 716
+
+        // Derive passwordBytes using s2k_fo: PBKDF2(hexEncodedString(SHA256(password)))
+        let pwdDigest = Self.sha256(Data(password.utf8))
+        let hexString = pwdDigest.map { String(format: "%02hhx", $0) }.joined()
+        let s2kFoInput = Data(hexString.utf8)
+        #expect(s2kFoInput.count == 64)
+
+        let derivedKey = CryptoUtilities.pbkdf2SHA256(password: s2kFoInput, salt: salt, rounds: iterations, outputLength: 32)
+        let passwordBytes = try #require(derivedKey)
+
+        // Derive x = SHA256(salt || SHA256(":" || passwordBytes))
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xData = Self.sha256(salt + h1)
+
+        // Simulated Server: Compute verifier v = g^x mod N
+        let verifierV = try computeServerVerifier(x: xData)
+
+        // 1. Client starts authentication and generates public A
+        let client = try #require(SRPClient())
+        let clientA = try #require(client.startAuthentication())
+
+        // 2. Server generates private ephemeral b, public ephemeral B = (k*v + g^b) mod N
+        let (serverB, serverPrivateKeyB) = try generateServerEphemeral(verifier: verifierV)
+
+        // 3. Client processes challenge with server B -> produces M1 proof
+        let clientM1 = client.processChallenge(
+            username: username,
+            password: passwordBytes,
+            salt: salt,
+            serverPublicKey: serverB
+        )
+        let m1Data = try #require(clientM1)
+        #expect(m1Data.count == 32)
+
+        // 4. Server computes shared secret S, session key K, and verifies M1
+        let (serverM1, serverM2, serverK) = try computeServerVerification(
+            username: username,
+            salt: salt,
+            clientA: clientA,
+            serverB: serverB,
+            serverPrivateB: serverPrivateKeyB,
+            verifierV: verifierV
+        )
+
+        // Server confirms Client M1 matches
+        #expect(m1Data == serverM1)
+
+        // 5. Client verifies Server Proof M2
+        let isServerVerified = client.verifyServerProof(serverM2)
+        #expect(isServerVerified)
+
+        // 6. Both client and server derived the identical session key K
+        let clientK = try #require(client.sessionKey())
+        #expect(clientK == serverK)
+        #expect(clientK.count == 32)
+    }
+
+    @Test
     func srpWrongPasswordFailure() throws {
         let username = "user@test.com"
         let realPasswordBytes = Data(repeating: 0x11, count: 32)
