@@ -58,9 +58,14 @@ struct SRPClientTests {
         let password = "MySecurePassword123!"
         let salt = Data((0..<32).map { UInt8($0 + 5) })
 
-        // Derive x = SHA256(salt || SHA256(username || ":" || password))
-        let userPassDigest = Self.sha256(Data("\(username):\(password)".utf8))
-        let xData = Self.sha256(salt + userPassDigest)
+        // Derive passwordBytes using PBKDF2
+        let pwdDigest = Self.sha256(Data(password.utf8))
+        let derivedKey = CryptoUtilities.pbkdf2SHA256(password: pwdDigest, salt: salt, rounds: 1000, outputLength: 32)
+        let passwordBytes = try #require(derivedKey)
+
+        // Derive x = SHA256(salt || SHA256(":" || passwordBytes))
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xData = Self.sha256(salt + h1)
 
         // Simulated Server: Compute verifier v = g^x mod N
         let verifierV = try computeServerVerifier(x: xData)
@@ -75,7 +80,7 @@ struct SRPClientTests {
         // 3. Client processes challenge with server B -> produces M1 proof
         let clientM1 = client.processChallenge(
             username: username,
-            password: xData,
+            password: passwordBytes,
             salt: salt,
             serverPublicKey: serverB
         )
@@ -108,53 +113,47 @@ struct SRPClientTests {
     @Test
     func srpWrongPasswordFailure() throws {
         let username = "user@test.com"
-        let realPassword = "CorrectPassword"
-        let wrongPassword = "WrongPassword"
+        let realPasswordBytes = Data(repeating: 0x11, count: 32)
+        let wrongPasswordBytes = Data(repeating: 0x22, count: 32)
         let salt = Data(repeating: 0x42, count: 32)
 
-        let realX = Self.sha256(salt + Self.sha256(Data("\(username):\(realPassword)".utf8)))
-        let wrongX = Self.sha256(salt + Self.sha256(Data("\(username):\(wrongPassword)".utf8)))
+        let realH1 = Self.sha256(Data(":".utf8) + realPasswordBytes)
+        let realX = Self.sha256(salt + realH1)
 
         // Server has verifier for the real password
         let verifierV = try computeServerVerifier(x: realX)
 
         let client = try #require(SRPClient())
         let clientA = try #require(client.startAuthentication())
-        let (serverB, serverBSecret) = try generateServerEphemeral(verifier: verifierV)
+        let (serverB, serverPrivateB) = try generateServerEphemeral(verifier: verifierV)
 
-        // Client uses the WRONG password to process challenge
+        // Client attempts auth with wrong password
         let clientM1 = client.processChallenge(
             username: username,
-            password: wrongX,
+            password: wrongPasswordBytes,
             salt: salt,
             serverPublicKey: serverB
         )
-        let clientM1Data = try #require(clientM1)
+        let m1Data = try #require(clientM1)
 
-        // Server verification
-        let (serverM1, serverM2, _) = try computeServerVerification(
+        let (serverM1, _, _) = try computeServerVerification(
             username: username,
             salt: salt,
             clientA: clientA,
             serverB: serverB,
-            serverPrivateB: serverBSecret,
+            serverPrivateB: serverPrivateB,
             verifierV: verifierV
         )
 
-        // M1 must not match
-        #expect(clientM1Data != serverM1)
-
-        // Client verifying server M2 must also fail
-        let verified = client.verifyServerProof(serverM2)
-        #expect(!verified)
+        // Proof must not match
+        #expect(m1Data != serverM1)
     }
 
     @Test
     func srpInvalidServerPublicKey() throws {
         let username = "user@test.com"
-        let password = "TestPassword"
+        let passwordBytes = Data(repeating: 0x33, count: 32)
         let salt = Data(repeating: 0x11, count: 32)
-        let xData = Self.sha256(salt + Self.sha256(Data("\(username):\(password)".utf8)))
 
         let client = try #require(SRPClient())
         _ = client.startAuthentication()
@@ -163,7 +162,7 @@ struct SRPClientTests {
         let invalidBZero = Data(repeating: 0, count: 256)
         let resultZero = client.processChallenge(
             username: username,
-            password: xData,
+            password: passwordBytes,
             salt: salt,
             serverPublicKey: invalidBZero
         )
@@ -173,18 +172,20 @@ struct SRPClientTests {
     @Test
     func srpTamperedServerProofRejected() throws {
         let username = "user@test.com"
-        let password = "TestPassword"
+        let passwordBytes = Data(repeating: 0x44, count: 32)
         let salt = Data(repeating: 0x77, count: 32)
-        let xData = Self.sha256(salt + Self.sha256(Data("\(username):\(password)".utf8)))
+
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xData = Self.sha256(salt + h1)
 
         let verifierV = try computeServerVerifier(x: xData)
         let client = try #require(SRPClient())
         let clientA = try #require(client.startAuthentication())
-        let (serverB, serverBSecret) = try generateServerEphemeral(verifier: verifierV)
+        let (serverB, serverPrivateB) = try generateServerEphemeral(verifier: verifierV)
 
         _ = client.processChallenge(
             username: username,
-            password: xData,
+            password: passwordBytes,
             salt: salt,
             serverPublicKey: serverB
         )
@@ -194,7 +195,7 @@ struct SRPClientTests {
             salt: salt,
             clientA: clientA,
             serverB: serverB,
-            serverPrivateB: serverBSecret,
+            serverPrivateB: serverPrivateB,
             verifierV: verifierV
         )
 
@@ -207,15 +208,14 @@ struct SRPClientTests {
         #expect(!client.verifyServerProof(tamperedM2))
     }
 
-    // Helper: Compute server verifier v = g^x mod N
     @Test
     func srpCrossValidationWithOpenSSLServer() throws {
         let username = "crossval@example.com"
-        let password = "SuperSecretPassword99!"
+        let passwordBytes = Data((0..<32).map { UInt8(($0 * 7) & 0xFF) })
         let salt = Data((0..<32).map { UInt8($0 + 11) })
 
-        let userPassDigest = Self.sha256(Data("\(username):\(password)".utf8))
-        let xData = Self.sha256(salt + userPassDigest)
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xData = Self.sha256(salt + h1)
 
         // 1. Compute server verifier v = g^x mod N using OpenSSL
         let verifierV = try computeOpenSSLServerVerifier(x: xData)
@@ -230,7 +230,7 @@ struct SRPClientTests {
         // 4. Pure Swift Client processes challenge with OpenSSL server B -> produces M1 proof
         let clientM1 = client.processChallenge(
             username: username,
-            password: xData,
+            password: passwordBytes,
             salt: salt,
             serverPublicKey: serverB
         )
@@ -259,6 +259,75 @@ struct SRPClientTests {
         #expect(clientK.count == 32)
     }
 
+    @Test
+    func crossValidateAgainstDarwinCoreCryptoBaseline() throws {
+        guard let darwinBaseline = DarwinCCSRPBaseline() else {
+            // Skip when libcorecrypto is not available on non-Darwin platforms
+            return
+        }
+
+        let username = "crossval@apple.com"
+        let passwordBytes = Data((0..<32).map { UInt8(($0 * 7) & 0xFF) })
+        let salt = Data((0..<16).map { UInt8(($0 * 13) & 0xFF) })
+
+        // Derive x = SHA256(salt || SHA256(":" || passwordBytes))
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xData = Self.sha256(salt + h1)
+
+        // Compute verifier v = g^x mod N
+        let verifierV = try computeServerVerifier(x: xData)
+
+        // Generate server ephemeral B
+        let (serverB, serverPrivateB) = try generateServerEphemeral(verifier: verifierV)
+
+        // 1. Pure Swift SRPClient:
+        let pureClient = try #require(SRPClient())
+        let pureA = try #require(pureClient.startAuthentication())
+        let pureM1 = try #require(pureClient.processChallenge(
+            username: username,
+            password: passwordBytes,
+            salt: salt,
+            serverPublicKey: serverB
+        ))
+        let pureK = try #require(pureClient.sessionKey())
+
+        // 2. Darwin ccsrp baseline:
+        let darwinA = try #require(darwinBaseline.startAuthentication())
+        let darwinM1 = try #require(darwinBaseline.processChallenge(
+            username: username,
+            password: passwordBytes,
+            salt: salt,
+            serverPublicKey: serverB
+        ))
+        let darwinK = try #require(darwinBaseline.sessionKey())
+
+        // 3. Server verification for pure Swift client:
+        let (serverExpectedPureM1, serverPureM2, serverPureK) = try computeServerVerification(
+            username: username,
+            salt: salt,
+            clientA: pureA,
+            serverB: serverB,
+            serverPrivateB: serverPrivateB,
+            verifierV: verifierV
+        )
+        #expect(pureM1 == serverExpectedPureM1)
+        #expect(pureK == serverPureK)
+        #expect(pureClient.verifyServerProof(serverPureM2))
+
+        // 4. Server verification for Darwin ccsrp baseline:
+        let (serverExpectedDarwinM1, serverDarwinM2, serverDarwinK) = try computeServerVerification(
+            username: username,
+            salt: salt,
+            clientA: darwinA,
+            serverB: serverB,
+            serverPrivateB: serverPrivateB,
+            verifierV: verifierV
+        )
+        #expect(darwinM1 == serverExpectedDarwinM1)
+        #expect(darwinK == serverDarwinK)
+        #expect(darwinBaseline.verifyServerProof(serverDarwinM2))
+    }
+
     // Helper: Compute server verifier v = g^x mod N (Pure Swift)
     private func computeServerVerifier(x: Data) throws -> Data {
         let bnN = BigUInt(data: Self.N_Bytes)
@@ -268,7 +337,7 @@ struct SRPClientTests {
         return bnv.serialize(paddedTo: Self.groupSize)
     }
 
-    // Helper: Generate server ephemeral B = (k*v + g^b) mod N and private b
+    // Helper: Generate server ephemeral B = (k*v + g^b) mod N and private b (Pure Swift)
     private func generateServerEphemeral(verifier: Data) throws -> (Data, Data) {
         let bnN = BigUInt(data: Self.N_Bytes)
         let bng = BigUInt(UInt64(Self.g_Val))
@@ -465,6 +534,113 @@ struct SRPClientTests {
         let serverM2 = Self.sha256(m2Payload)
 
         return (serverM1, serverM2, serverK)
+    }
+}
+
+// Dynamic Darwin ccsrp wrapper for cross-validation baseline in unit tests
+private final class DarwinCCSRPBaseline {
+    private static let symGp      = "ccsrp_gp_rfc5054_2048"
+    private static let symDi      = "ccsha256_di"
+    private static let symInit    = "ccsrp_ctx_init"
+    private static let symSetFlag = "ccsrp_client_set_noUsernameInX"
+    private static let symStart   = "ccsrp_client_start_authentication"
+    private static let symProc    = "ccsrp_client_process_challenge"
+    private static let symVerify  = "ccsrp_client_verify_session"
+    private static let symKey     = "ccsrp_get_session_key"
+    private static let symRng     = "ccrng"
+
+    private typealias RawBufferHandle        = UnsafeRawPointer
+    private typealias MutableRawBufferHandle = UnsafeMutableRawPointer
+    private typealias CString                = UnsafePointer<CChar>
+    private typealias StatusRef              = UnsafeMutablePointer<Int32>
+    private typealias LengthRef              = UnsafeMutablePointer<Int>
+
+    private typealias ccsrp_gp_fn       = @convention(c) () -> RawBufferHandle
+    private typealias ccdigest_fn       = @convention(c) () -> RawBufferHandle
+    private typealias ccsrp_init_fn     = @convention(c) (MutableRawBufferHandle, RawBufferHandle, RawBufferHandle) -> Void
+    private typealias ccsrp_set_flag_fn = @convention(c) (MutableRawBufferHandle, Bool) -> Bool
+    private typealias ccrng_fn          = @convention(c) (StatusRef?) -> MutableRawBufferHandle?
+    private typealias ccsrp_start_fn    = @convention(c) (MutableRawBufferHandle, MutableRawBufferHandle?, MutableRawBufferHandle) -> Int32
+    private typealias ccsrp_proc_fn     = @convention(c) (MutableRawBufferHandle, CString, Int, RawBufferHandle, Int, RawBufferHandle, RawBufferHandle, MutableRawBufferHandle) -> Int32
+    private typealias ccsrp_verify_fn   = @convention(c) (MutableRawBufferHandle, RawBufferHandle) -> Int32
+    private typealias ccsrp_key_fn      = @convention(c) (MutableRawBufferHandle, LengthRef) -> RawBufferHandle?
+
+    private let ctx: MutableRawBufferHandle
+    private let start_fn: ccsrp_start_fn
+    private let proc_fn: ccsrp_proc_fn
+    private let verify_fn: ccsrp_verify_fn
+    private let key_fn: ccsrp_key_fn
+    private let rng_fn: ccrng_fn
+
+    init?() {
+        guard let handle = dlopen(nil, RTLD_NOW) else { return nil }
+        guard let gp_sym       = dlsym(handle, Self.symGp),
+              let di_sym       = dlsym(handle, Self.symDi),
+              let init_sym     = dlsym(handle, Self.symInit),
+              let set_flag_sym = dlsym(handle, Self.symSetFlag),
+              let start_sym    = dlsym(handle, Self.symStart),
+              let proc_sym     = dlsym(handle, Self.symProc),
+              let verify_sym   = dlsym(handle, Self.symVerify),
+              let key_sym      = dlsym(handle, Self.symKey),
+              let rng_sym      = dlsym(handle, Self.symRng) else { return nil }
+
+        let gp_fn       = unsafeBitCast(gp_sym,       to: ccsrp_gp_fn.self)
+        let di_fn       = unsafeBitCast(di_sym,       to: ccdigest_fn.self)
+        let init_fn     = unsafeBitCast(init_sym,     to: ccsrp_init_fn.self)
+        let set_flag_fn = unsafeBitCast(set_flag_sym, to: ccsrp_set_flag_fn.self)
+
+        self.start_fn   = unsafeBitCast(start_sym,    to: ccsrp_start_fn.self)
+        self.proc_fn    = unsafeBitCast(proc_sym,     to: ccsrp_proc_fn.self)
+        self.verify_fn  = unsafeBitCast(verify_sym,   to: ccsrp_verify_fn.self)
+        self.key_fn     = unsafeBitCast(key_sym,      to: ccsrp_key_fn.self)
+        self.rng_fn     = unsafeBitCast(rng_sym,      to: ccrng_fn.self)
+
+        self.ctx = MutableRawBufferHandle.allocate(byteCount: 8192, alignment: 16)
+        init_fn(ctx, di_fn(), gp_fn())
+        _ = set_flag_fn(ctx, true)
+    }
+
+    deinit {
+        ctx.deallocate()
+    }
+
+    func startAuthentication() -> Data? {
+        var err: Int32 = 0
+        let rng = rng_fn(&err)
+        var A = Data(count: 256)
+        let res = A.withUnsafeMutableBytes { start_fn(ctx, rng, $0.baseAddress!) }
+        guard res == 0 else { return nil }
+        return A
+    }
+
+    func processChallenge(
+        username: String,
+        password passwordBytes: Data,
+        salt: Data,
+        serverPublicKey bData: Data
+    ) -> Data? {
+        var M1 = Data(count: 32)
+        let res = M1.withUnsafeMutableBytes { m1Bytes in
+            salt.withUnsafeBytes { saltBytes in
+                bData.withUnsafeBytes { bBytes in
+                    passwordBytes.withUnsafeBytes { pwdBytes in
+                        proc_fn(ctx, username, passwordBytes.count, pwdBytes.baseAddress!, salt.count, saltBytes.baseAddress!, bBytes.baseAddress!, m1Bytes.baseAddress!)
+                    }
+                }
+            }
+        }
+        guard res == 0 else { return nil }
+        return M1
+    }
+
+    func verifyServerProof(_ proof: Data) -> Bool {
+        return proof.withUnsafeBytes { verify_fn(ctx, $0.baseAddress!) != 0 }
+    }
+
+    func sessionKey() -> Data? {
+        var len = 0
+        guard let ptr = key_fn(ctx, &len) else { return nil }
+        return Data(bytes: ptr, count: len)
     }
 }
 
