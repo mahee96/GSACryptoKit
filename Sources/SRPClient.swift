@@ -71,7 +71,7 @@ public final class SRPClient {
 
     public func processChallenge(
         username: String,
-        password xData: Data,
+        password passwordBytes: Data,
         salt: Data,
         serverPublicKey bData: Data
     ) -> Data? {
@@ -91,8 +91,12 @@ public final class SRPClient {
         let bnu = BigUInt(data: uData)
         guard !bnu.isZero else { return nil }
 
-        // 4. Load x
-        let bnx = BigUInt(data: xData)
+        // 4. corecrypto srp (ccsrp) derives x as:
+        // h1 = SHA256(":" || password)
+        // x  = SHA256(salt || h1)
+        let h1 = Self.sha256(Data(":".utf8) + passwordBytes)
+        let xHash = Self.sha256(salt + h1)
+        let bnx = BigUInt(data: xHash)
 
         // 5. v = g^x mod N
         let bnv = bng.power(bnx, modulus: bnN)
