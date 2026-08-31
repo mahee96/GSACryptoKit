@@ -18,7 +18,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", "1.0.0" ..< "5.0.0")
+        .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.3.1")
     ],
     targets: [
         .binaryTarget(
